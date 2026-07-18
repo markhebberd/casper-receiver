@@ -4,10 +4,11 @@
   <meta charset="utf-8">
   <title>Casper Cast Receiver</title>
   <!-- Cast Application Framework (CAF) receiver SDK.
-       crossorigin="anonymous" so errors thrown inside this cross-origin script reach our
-       window.onerror with a real message/file/line instead of the opaque "Script error." -->
-  <script crossorigin="anonymous"
-          src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+       NOTE: do NOT add crossorigin="anonymous" here — gstatic won't serve this script under
+       CORS on the Chromecast, and the browser then refuses the load, leaving cast.framework
+       undefined (proven on-device, r4). We surface real error messages by catching SDK calls
+       in our own same-origin try/catch instead (see init below). -->
+  <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
   <style>
     html, body { margin: 0; height: 100%; background: #000; color: #eee;
                  font-family: monospace; overflow: hidden; }
@@ -28,7 +29,7 @@
   <script>
     // Bump this on every deploy so the on-screen log tells you which receiver the TV
     // actually loaded — GitHub Pages caching means "I pushed it" isn't "it's live".
-    var RECEIVER_BUILD = 'r4 (unmask errors)';
+    var RECEIVER_BUILD = 'r5 (catch init)';
 
     var logEl = document.getElementById('log');
     var lines = [];
@@ -66,6 +67,11 @@
       throw new Error('CAF framework unavailable');
     }
 
+    // Wrap all SDK init so a throw from the cross-origin framework is CAUGHT here, in our
+    // same-origin code, with its real message + stack. An UNCAUGHT cross-origin throw only
+    // reaches window.onerror as the useless "Script error." (that was r3). This is the fix
+    // for that opacity that doesn't break the SDK load the way crossorigin did.
+    try {
     var ctx = cast.framework.CastReceiverContext.getInstance();
     var pm = ctx.getPlayerManager();
 
@@ -160,6 +166,12 @@
     probeCodecs();
     ctx.start(opts);
     log('receiver started', 'ok');
+    } catch (e) {
+      log('INIT FAILED: ' + (e && e.message ? e.message : e), 'err');
+      if (e && e.stack) {
+        log('stack: ' + String(e.stack).split('\n').slice(0, 3).join('  |  '), 'err');
+      }
+    }
   </script>
 </body>
 </html>
