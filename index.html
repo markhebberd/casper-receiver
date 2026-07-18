@@ -10,23 +10,29 @@
                  font-family: monospace; overflow: hidden; }
     cast-media-player { position: absolute; inset: 0; }
     /* On-screen log overlay — so the TV itself shows what happened (no chrome://inspect needed). */
-    #log { position: absolute; left: 0; right: 0; bottom: 0; max-height: 45%;
+    #log { position: absolute; left: 0; right: 0; bottom: 0; max-height: 55%;
            overflow: hidden; padding: 12px 16px; font-size: 20px; line-height: 1.35;
            background: rgba(0,0,0,0.72); white-space: pre-wrap; word-break: break-all; }
-    .err { color: #ff6b6b; }
-    .ok  { color: #6bff9c; }
+    .err  { color: #ff6b6b; }
+    .ok   { color: #6bff9c; }
+    .warn { color: #ffd36b; }
+    .dim  { color: #9aa; }
   </style>
 </head>
 <body>
   <cast-media-player></cast-media-player>
   <div id="log"></div>
   <script>
+    // Bump this on every deploy so the on-screen log tells you which receiver the TV
+    // actually loaded — GitHub Pages caching means "I pushed it" isn't "it's live".
+    var RECEIVER_BUILD = 'r3 (fail-visible)';
+
     var logEl = document.getElementById('log');
     var lines = [];
     function log(msg, cls) {
       var t = (Math.round(performance.now()) / 1000).toFixed(2);
       lines.push({ t: t, msg: msg, cls: cls || '' });
-      if (lines.length > 16) lines.shift();
+      if (lines.length > 20) lines.shift();
       logEl.innerHTML = lines.map(function (l) {
         return '<div class="' + l.cls + '">' + l.t + '  ' +
           String(l.msg).replace(/</g, '&lt;') + '</div>';
@@ -35,18 +41,77 @@
       console.log('CASPER ' + msg);
     }
 
+    // Register failure handlers FIRST, before touching the CAF SDK. If the framework
+    // script failed to load, the very next line throws — and without these already in
+    // place the TV just sits on a black screen with a spinner and no clue why, while the
+    // sender hangs in "connecting" forever. With them, any such failure paints red here.
+    window.addEventListener('error', function (e) {
+      log('JS ERROR ' + (e.message || e), 'err');
+    });
+    window.addEventListener('unhandledrejection', function (e) {
+      log('PROMISE REJECT ' + ((e.reason && e.reason.message) || e.reason || e), 'err');
+    });
+    log('boot ' + RECEIVER_BUILD, 'ok');
+
+    // Guard the SDK handle: a failed framework load becomes a plain on-screen message
+    // instead of a silent throw. This is the single most common "stuck on black + spinner"
+    // cause, and previously it left no trace at all.
+    if (typeof cast === 'undefined' || !cast.framework) {
+      log('FATAL: CAF framework did not load (cast.framework undefined) — check the ' +
+          "receiver device's network access to gstatic.com", 'err');
+      throw new Error('CAF framework unavailable');
+    }
+
     var ctx = cast.framework.CastReceiverContext.getInstance();
     var pm = ctx.getPlayerManager();
 
-    // Surface what the sender actually asks us to load.
+    // What can this specific TV actually decode? Probe before any cast so the log shows
+    // the device's real codec support — the thing the sender has to match. When a cast
+    // later fails, this table up top is the first place to look: sender codec vs. what
+    // the hardware here admits it can play. Container+codec strings mirror what a remux
+    // or HLS segmenter would hand the receiver.
+    function probeCodecs() {
+      if (typeof ctx.canDisplayType !== 'function') {
+        log('canDisplayType unavailable — cannot probe codecs', 'warn');
+        return;
+      }
+      var probes = [
+        ['H.264',  'video/mp4',  'avc1.640028'],
+        ['HEVC',   'video/mp4',  'hev1.1.6.L93.B0'],
+        ['VP9',    'video/webm', 'vp9'],
+        ['AV1',    'video/mp4',  'av01.0.05M.08'],
+        ['AAC',    'audio/mp4',  'mp4a.40.2'],
+        ['AC-3',   'audio/mp4',  'ac-3'],
+        ['E-AC-3', 'audio/mp4',  'ec-3'],
+        ['FLAC',   'audio/mp4',  'fLaC'],
+        ['Opus',   'audio/webm', 'opus']
+      ];
+      var yes = [], no = [];
+      probes.forEach(function (p) {
+        var ok = false;
+        try { ok = ctx.canDisplayType(p[1], p[2]); } catch (e) { ok = false; }
+        (ok ? yes : no).push(p[0]);
+      });
+      log('decodes: ' + (yes.join(' ') || '(none)'), 'ok');
+      log('rejects: ' + (no.join(' ') || '(none)'), no.length ? 'warn' : 'dim');
+    }
+
+    // Surface what the sender actually asks us to load — including declared codecs, so a
+    // sender/receiver codec mismatch is visible without decoding a single frame.
     pm.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, function (req) {
       try {
         var m = req.media || {};
-        log('LOAD contentId=' + m.contentId +
+        var tracks = m.tracks || [];
+        log('LOAD id=' + m.contentId +
             ' type=' + m.contentType +
             ' stream=' + m.streamType +
-            ' tracks=' + ((m.tracks || []).length));
-      } catch (e) { log('LOAD (unparsable): ' + e); }
+            ' codecs=' + (m.customData && m.customData.codecs || '?') +
+            ' tracks=' + tracks.length);
+        tracks.forEach(function (tr) {
+          log('  track#' + tr.trackId + ' ' + tr.type + '/' + tr.subtype +
+              ' ' + (tr.trackContentType || '') + ' ' + (tr.language || ''), 'dim');
+        });
+      } catch (e) { log('LOAD (unparsable): ' + e, 'warn'); }
       return req;
     });
 
@@ -57,27 +122,38 @@
     pm.addEventListener(cast.framework.events.EventType.MEDIA_STATUS, function (e) {
       var s = e.mediaStatus || {};
       if (s.playerState) log('status=' + s.playerState +
-        (s.idleReason ? ' idle=' + s.idleReason : ''));
+        (s.idleReason ? ' idle=' + s.idleReason : ''),
+        s.idleReason && s.idleReason !== 'FINISHED' ? 'warn' : '');
     });
     pm.addEventListener(cast.framework.events.EventType.BUFFERING, function (e) {
-      log('buffering=' + e.isBuffering);
+      log('buffering=' + e.isBuffering, e.isBuffering ? 'dim' : '');
     });
 
-    // The prize: the actual decode/network error, with detail.
+    // Once media loads, report what the receiver actually chose to decode — the codecs it
+    // committed to, which confirm (or contradict) what the sender declared above.
+    pm.addEventListener(cast.framework.events.EventType.MEDIA_INFORMATION_CHANGED, function (e) {
+      try {
+        var info = e.mediaInformation || {};
+        var hls = info.hlsSegmentFormat || info.hlsVideoSegmentFormat;
+        log('media: type=' + info.contentType +
+            (hls ? ' hls=' + hls : '') +
+            ' dur=' + (info.duration != null ? info.duration.toFixed(1) + 's' : '?'), 'dim');
+      } catch (e2) { /* best-effort */ }
+    });
+
+    // The prize: the actual decode/network error. reason and detailedErrorCode are the
+    // two fields worth having — the numeric detailedErrorCode maps to a documented cause
+    // (e.g. 104 SEGMENT_NETWORK, 110 MEDIA_SRC_NOT_SUPPORTED, 314 MEDIA_DECODE).
     pm.addEventListener(cast.framework.events.EventType.ERROR, function (e) {
       log('ERROR reason=' + e.reason +
-          ' code=' + e.error + ' detail=' + JSON.stringify(e.detailedErrorCode || e), 'err');
+          ' detailedCode=' + e.detailedErrorCode +
+          (e.error ? ' error=' + JSON.stringify(e.error) : ''), 'err');
     });
 
-    // Catch anything the SDK throws that isn't a player event.
-    window.addEventListener('error', function (e) {
-      log('JS ERROR ' + (e.message || e), 'err');
-    });
-
-    // Broaden the codecs the receiver advertises so it doesn't reject before trying.
     var opts = new cast.framework.CastReceiverOptions();
     opts.maxInactivity = 3600;               // don't tear down while we debug
-    log('receiver starting…', 'ok');
+    log('receiver starting… ' + RECEIVER_BUILD, 'ok');
+    probeCodecs();
     ctx.start(opts);
     log('receiver started', 'ok');
   </script>
