@@ -3,8 +3,11 @@
 <head>
   <meta charset="utf-8">
   <title>Casper Cast Receiver</title>
-  <!-- Cast Application Framework (CAF) receiver SDK -->
-  <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+  <!-- Cast Application Framework (CAF) receiver SDK.
+       crossorigin="anonymous" so errors thrown inside this cross-origin script reach our
+       window.onerror with a real message/file/line instead of the opaque "Script error." -->
+  <script crossorigin="anonymous"
+          src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
   <style>
     html, body { margin: 0; height: 100%; background: #000; color: #eee;
                  font-family: monospace; overflow: hidden; }
@@ -25,7 +28,7 @@
   <script>
     // Bump this on every deploy so the on-screen log tells you which receiver the TV
     // actually loaded — GitHub Pages caching means "I pushed it" isn't "it's live".
-    var RECEIVER_BUILD = 'r3 (fail-visible)';
+    var RECEIVER_BUILD = 'r4 (unmask errors)';
 
     var logEl = document.getElementById('log');
     var lines = [];
@@ -46,7 +49,8 @@
     // place the TV just sits on a black screen with a spinner and no clue why, while the
     // sender hangs in "connecting" forever. With them, any such failure paints red here.
     window.addEventListener('error', function (e) {
-      log('JS ERROR ' + (e.message || e), 'err');
+      var where = e.filename ? ' @ ' + e.filename + ':' + e.lineno + ':' + e.colno : '';
+      log('JS ERROR ' + (e.message || e) + where, 'err');
     });
     window.addEventListener('unhandledrejection', function (e) {
       log('PROMISE REJECT ' + ((e.reason && e.reason.message) || e.reason || e), 'err');
