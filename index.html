@@ -29,7 +29,7 @@
   <script>
     // Bump this on every deploy so the on-screen log tells you which receiver the TV
     // actually loaded — GitHub Pages caching means "I pushed it" isn't "it's live".
-    var RECEIVER_BUILD = 'r5 (catch init)';
+    var RECEIVER_BUILD = 'r6 (tolerant listeners)';
 
     var logEl = document.getElementById('log');
     var lines = [];
@@ -125,23 +125,37 @@
       return req;
     });
 
+    // Register a player-manager listener by EventType *name*, tolerating names this SDK
+    // build doesn't define. A bad constant is `undefined`, and addEventListener(undefined)
+    // THROWS — which previously aborted the whole receiver before ctx.start() and left it
+    // dead on a black screen. Now an unknown name is skipped with a warning, so one wrong
+    // enum can't take the receiver down, and the log names exactly which one to fix.
+    function on(name, handler) {
+      var type = cast.framework.events.EventType[name];
+      if (type === undefined) {
+        log('skip listener: EventType.' + name + ' not defined in this SDK', 'warn');
+        return;
+      }
+      pm.addEventListener(type, handler);
+    }
+
     // Player state transitions — this is what "buffering forever" would show.
-    pm.addEventListener(cast.framework.events.EventType.PLAYER_STATE_CHANGED, function (e) {
+    on('PLAYER_STATE_CHANGED', function (e) {
       log('state=' + e.playerState, e.playerState === 'PLAYING' ? 'ok' : '');
     });
-    pm.addEventListener(cast.framework.events.EventType.MEDIA_STATUS, function (e) {
+    on('MEDIA_STATUS', function (e) {
       var s = e.mediaStatus || {};
       if (s.playerState) log('status=' + s.playerState +
         (s.idleReason ? ' idle=' + s.idleReason : ''),
         s.idleReason && s.idleReason !== 'FINISHED' ? 'warn' : '');
     });
-    pm.addEventListener(cast.framework.events.EventType.BUFFERING, function (e) {
+    on('BUFFERING', function (e) {
       log('buffering=' + e.isBuffering, e.isBuffering ? 'dim' : '');
     });
 
     // Once media loads, report what the receiver actually chose to decode — the codecs it
     // committed to, which confirm (or contradict) what the sender declared above.
-    pm.addEventListener(cast.framework.events.EventType.MEDIA_INFORMATION_CHANGED, function (e) {
+    on('MEDIA_INFORMATION_CHANGED', function (e) {
       try {
         var info = e.mediaInformation || {};
         var hls = info.hlsSegmentFormat || info.hlsVideoSegmentFormat;
@@ -154,7 +168,7 @@
     // The prize: the actual decode/network error. reason and detailedErrorCode are the
     // two fields worth having — the numeric detailedErrorCode maps to a documented cause
     // (e.g. 104 SEGMENT_NETWORK, 110 MEDIA_SRC_NOT_SUPPORTED, 314 MEDIA_DECODE).
-    pm.addEventListener(cast.framework.events.EventType.ERROR, function (e) {
+    on('ERROR', function (e) {
       log('ERROR reason=' + e.reason +
           ' detailedCode=' + e.detailedErrorCode +
           (e.error ? ' error=' + JSON.stringify(e.error) : ''), 'err');
