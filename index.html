@@ -29,7 +29,7 @@
   <script>
     // Bump this on every deploy so the on-screen log tells you which receiver the TV
     // actually loaded — GitHub Pages caching means "I pushed it" isn't "it's live".
-    var RECEIVER_BUILD = 'r6 (tolerant listeners)';
+    var RECEIVER_BUILD = 'r7 (toggle log)';
 
     var logEl = document.getElementById('log');
     var lines = [];
@@ -174,8 +174,24 @@
           (e.error ? ' error=' + JSON.stringify(e.error) : ''), 'err');
     });
 
+    // Let the Casper sender show/hide this on-screen log over a custom channel, so someone
+    // watching can dismiss the debug overlay without losing it for good. Default is visible
+    // (each cast starts shown); a {showLog:false} message hides it live.
+    var DEBUG_NAMESPACE = 'urn:x-cast:app.casper.podcast.debug';
+    ctx.addCustomMessageListener(DEBUG_NAMESPACE, function (event) {
+      try {
+        var d = event.data || {};
+        if (typeof d.showLog === 'boolean') {
+          logEl.style.display = d.showLog ? '' : 'none';
+          console.log('CASPER showLog=' + d.showLog);
+        }
+      } catch (e) { /* a debug channel must never break playback */ }
+    });
+
     var opts = new cast.framework.CastReceiverOptions();
     opts.maxInactivity = 3600;               // don't tear down while we debug
+    opts.customNamespaces = { };
+    opts.customNamespaces[DEBUG_NAMESPACE] = cast.framework.system.MessageType.JSON;
     log('receiver starting… ' + RECEIVER_BUILD, 'ok');
     probeCodecs();
     ctx.start(opts);
