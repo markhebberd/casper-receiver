@@ -1,0 +1,85 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Casper Cast Receiver</title>
+  <!-- Cast Application Framework (CAF) receiver SDK -->
+  <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+  <style>
+    html, body { margin: 0; height: 100%; background: #000; color: #eee;
+                 font-family: monospace; overflow: hidden; }
+    cast-media-player { position: absolute; inset: 0; }
+    /* On-screen log overlay — so the TV itself shows what happened (no chrome://inspect needed). */
+    #log { position: absolute; left: 0; right: 0; bottom: 0; max-height: 45%;
+           overflow: hidden; padding: 12px 16px; font-size: 20px; line-height: 1.35;
+           background: rgba(0,0,0,0.72); white-space: pre-wrap; word-break: break-all; }
+    .err { color: #ff6b6b; }
+    .ok  { color: #6bff9c; }
+  </style>
+</head>
+<body>
+  <cast-media-player></cast-media-player>
+  <div id="log"></div>
+  <script>
+    var logEl = document.getElementById('log');
+    var lines = [];
+    function log(msg, cls) {
+      var t = (Math.round(performance.now()) / 1000).toFixed(2);
+      lines.push({ t: t, msg: msg, cls: cls || '' });
+      if (lines.length > 16) lines.shift();
+      logEl.innerHTML = lines.map(function (l) {
+        return '<div class="' + l.cls + '">' + l.t + '  ' +
+          String(l.msg).replace(/</g, '&lt;') + '</div>';
+      }).join('');
+      // eslint-disable-next-line no-console
+      console.log('CASPER ' + msg);
+    }
+
+    var ctx = cast.framework.CastReceiverContext.getInstance();
+    var pm = ctx.getPlayerManager();
+
+    // Surface what the sender actually asks us to load.
+    pm.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, function (req) {
+      try {
+        var m = req.media || {};
+        log('LOAD contentId=' + m.contentId +
+            ' type=' + m.contentType +
+            ' stream=' + m.streamType +
+            ' tracks=' + ((m.tracks || []).length));
+      } catch (e) { log('LOAD (unparsable): ' + e); }
+      return req;
+    });
+
+    // Player state transitions — this is what "buffering forever" would show.
+    pm.addEventListener(cast.framework.events.EventType.PLAYER_STATE_CHANGED, function (e) {
+      log('state=' + e.playerState, e.playerState === 'PLAYING' ? 'ok' : '');
+    });
+    pm.addEventListener(cast.framework.events.EventType.MEDIA_STATUS, function (e) {
+      var s = e.mediaStatus || {};
+      if (s.playerState) log('status=' + s.playerState +
+        (s.idleReason ? ' idle=' + s.idleReason : ''));
+    });
+    pm.addEventListener(cast.framework.events.EventType.BUFFERING, function (e) {
+      log('buffering=' + e.isBuffering);
+    });
+
+    // The prize: the actual decode/network error, with detail.
+    pm.addEventListener(cast.framework.events.EventType.ERROR, function (e) {
+      log('ERROR reason=' + e.reason +
+          ' code=' + e.error + ' detail=' + JSON.stringify(e.detailedErrorCode || e), 'err');
+    });
+
+    // Catch anything the SDK throws that isn't a player event.
+    window.addEventListener('error', function (e) {
+      log('JS ERROR ' + (e.message || e), 'err');
+    });
+
+    // Broaden the codecs the receiver advertises so it doesn't reject before trying.
+    var opts = new cast.framework.CastReceiverOptions();
+    opts.maxInactivity = 3600;               // don't tear down while we debug
+    log('receiver starting…', 'ok');
+    ctx.start(opts);
+    log('receiver started', 'ok');
+  </script>
+</body>
+</html>
