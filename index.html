@@ -14,7 +14,9 @@
                  font-family: monospace; overflow: hidden; }
     cast-media-player { position: absolute; inset: 0; }
     /* On-screen log overlay — so the TV itself shows what happened (no chrome://inspect needed). */
-    #log { position: absolute; left: 0; right: 0; bottom: 0; max-height: 55%;
+    /* Hidden by default (r9): the sender's Now Playing toggle shows it via {showLog:true}.
+       Lines are still collected while hidden, so toggling on reveals the full history. */
+    #log { display: none; position: absolute; left: 0; right: 0; bottom: 0; max-height: 55%;
            overflow: hidden; padding: 12px 16px; font-size: 20px; line-height: 1.35;
            background: rgba(0,0,0,0.72); white-space: pre-wrap; word-break: break-all; }
     .err  { color: #ff6b6b; }
@@ -29,7 +31,7 @@
   <script>
     // Bump this on every deploy so the on-screen log tells you which receiver the TV
     // actually loaded — GitHub Pages caching means "I pushed it" isn't "it's live".
-    var RECEIVER_BUILD = 'r7 (toggle log)';
+    var RECEIVER_BUILD = 'r9 (log hidden by default)';
 
     var logEl = document.getElementById('log');
     var lines = [];
@@ -115,6 +117,7 @@
         log('LOAD id=' + m.contentId +
             ' type=' + m.contentType +
             ' stream=' + m.streamType +
+            ' dur=' + (m.duration != null ? m.duration + 's' : '?') +
             ' codecs=' + (m.customData && m.customData.codecs || '?') +
             ' tracks=' + tracks.length);
         tracks.forEach(function (tr) {
@@ -153,11 +156,13 @@
       log('buffering=' + e.isBuffering, e.isBuffering ? 'dim' : '');
     });
 
-    // Once media loads, report what the receiver actually chose to decode — the codecs it
-    // committed to, which confirm (or contradict) what the sender declared above.
+    // Once media loads, report what the receiver actually committed to. Read the player
+    // manager's own media information — the event's mediaInformation field is often absent
+    // or sparse, which previously printed a misleading "type=undefined dur=?" even when the
+    // load carried a full MediaInfo.
     on('MEDIA_INFORMATION_CHANGED', function (e) {
       try {
-        var info = e.mediaInformation || {};
+        var info = pm.getMediaInformation() || e.mediaInformation || {};
         var hls = info.hlsSegmentFormat || info.hlsVideoSegmentFormat;
         log('media: type=' + info.contentType +
             (hls ? ' hls=' + hls : '') +
@@ -174,15 +179,16 @@
           (e.error ? ' error=' + JSON.stringify(e.error) : ''), 'err');
     });
 
-    // Let the Casper sender show/hide this on-screen log over a custom channel, so someone
-    // watching can dismiss the debug overlay without losing it for good. Default is visible
-    // (each cast starts shown); a {showLog:false} message hides it live.
-    var DEBUG_NAMESPACE = 'urn:x-cast:app.casper.podcast.debug';
+    // Let the Casper sender show/hide this on-screen log over a custom channel. Hidden by
+    // default (r9); a {showLog:true} message reveals it with its collected history.
+    // NOTE: must set an explicit 'block' — '' would fall back to the stylesheet's
+    // display:none and the toggle could never show it.
+    var DEBUG_NAMESPACE = 'urn:x-cast:com.hebberd.castkit.debug';
     ctx.addCustomMessageListener(DEBUG_NAMESPACE, function (event) {
       try {
         var d = event.data || {};
         if (typeof d.showLog === 'boolean') {
-          logEl.style.display = d.showLog ? '' : 'none';
+          logEl.style.display = d.showLog ? 'block' : 'none';
           console.log('CASPER showLog=' + d.showLog);
         }
       } catch (e) { /* a debug channel must never break playback */ }
