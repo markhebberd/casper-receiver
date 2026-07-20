@@ -31,7 +31,7 @@
   <script>
     // Bump this on every deploy so the on-screen log tells you which receiver the TV
     // actually loaded — GitHub Pages caching means "I pushed it" isn't "it's live".
-    var RECEIVER_BUILD = 'r9 (log hidden by default)';
+    var RECEIVER_BUILD = 'r10 (load currentTime logged)';
 
     var logEl = document.getElementById('log');
     var lines = [];
@@ -118,6 +118,7 @@
             ' type=' + m.contentType +
             ' stream=' + m.streamType +
             ' dur=' + (m.duration != null ? m.duration + 's' : '?') +
+            ' start=' + (req.currentTime != null ? req.currentTime + 's' : '0') +
             ' codecs=' + (m.customData && m.customData.codecs || '?') +
             ' tracks=' + tracks.length);
         tracks.forEach(function (tr) {
