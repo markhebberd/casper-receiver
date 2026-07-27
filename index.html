@@ -31,13 +31,40 @@
   <script>
     // Bump this on every deploy so the on-screen log tells you which receiver the TV
     // actually loaded — GitHub Pages caching means "I pushed it" isn't "it's live".
-    var RECEIVER_BUILD = 'r10 (load currentTime logged)';
+    var RECEIVER_BUILD = 'r12 (log mirrored to the sender, prep pings)';
+
+    // Declared up here (not beside the listener below) because log mirroring starts with the
+    // very first boot line, long before the SDK wiring runs.
+    var DEBUG_NAMESPACE = 'urn:x-cast:com.hebberd.castkit.debug';
 
     var logEl = document.getElementById('log');
     var lines = [];
+    // Lines not yet delivered to the sender. Everything the receiver knows — the codec probe,
+    // the LOAD interception, and above all the ERROR event's reason/detailedErrorCode — used to
+    // exist ONLY as text painted on the TV, unreachable from the phone exactly when a failed
+    // cast made it worth reading. Mirroring the same log over the debug channel puts it in the
+    // phone's cast trace, where it survives the session ending.
+    var pending = [];
+    var started = false;
+    function mirror(l) {
+      pending.push(l);
+      if (pending.length > 120) pending.shift();
+      flush();
+    }
+    function flush() {
+      if (!started || typeof ctx === 'undefined' || !ctx) return;
+      try {
+        while (pending.length) {
+          // undefined senderId = broadcast to every connected sender.
+          ctx.sendCustomMessage(DEBUG_NAMESPACE, undefined, { log: pending[0] });
+          pending.shift();   // only drops once the send didn't throw
+        }
+      } catch (e) { /* no sender attached yet — keep them buffered and retry */ }
+    }
     function log(msg, cls) {
       var t = (Math.round(performance.now()) / 1000).toFixed(2);
-      lines.push({ t: t, msg: msg, cls: cls || '' });
+      var line = { t: t, msg: String(msg), cls: cls || '' };
+      lines.push(line);
       if (lines.length > 20) lines.shift();
       logEl.innerHTML = lines.map(function (l) {
         return '<div class="' + l.cls + '">' + l.t + '  ' +
@@ -45,6 +72,7 @@
       }).join('');
       // eslint-disable-next-line no-console
       console.log('CASPER ' + msg);
+      try { mirror(line); } catch (e) { /* logging must never break playback */ }
     }
 
     // Register failure handlers FIRST, before touching the CAF SDK. If the framework
@@ -184,13 +212,23 @@
     // default (r9); a {showLog:true} message reveals it with its collected history.
     // NOTE: must set an explicit 'block' — '' would fall back to the stylesheet's
     // display:none and the toggle could never show it.
-    var DEBUG_NAMESPACE = 'urn:x-cast:com.hebberd.castkit.debug';
     ctx.addCustomMessageListener(DEBUG_NAMESPACE, function (event) {
       try {
         var d = event.data || {};
         if (typeof d.showLog === 'boolean') {
           logEl.style.display = d.showLog ? 'block' : 'none';
           console.log('CASPER showLog=' + d.showLog);
+        }
+        // "The cast is still coming" — the sender pings this every 15s while it remuxes, which
+        // can run for many minutes. Logged (and so timestamped on this side too) so a receiver
+        // that goes away mid-preparation is provably distinguishable from one that never heard
+        // from the sender again.
+        if (typeof d.prep === 'string') log('sender: ' + d.prep, 'dim');
+        // A sender that attached late (the receiver boots, probes codecs and logs the load
+        // before the app's session object exists) asks for the history it missed.
+        if (d.replay === true) {
+          lines.forEach(function (l) { pending.push(l); });
+          flush();
         }
       } catch (e) { /* a debug channel must never break playback */ }
     });
@@ -202,6 +240,12 @@
     log('receiver starting… ' + RECEIVER_BUILD, 'ok');
     probeCodecs();
     ctx.start(opts);
+    started = true;
+    // Anything logged during boot (codec probe included) goes out as soon as a sender attaches.
+    try {
+      ctx.addEventListener(cast.framework.system.EventType.SENDER_CONNECTED, flush);
+    } catch (e) { log('sender-connected hook unavailable: ' + e, 'warn'); }
+    setInterval(flush, 2000);   // safety net: nothing stays stuck in the buffer
     log('receiver started', 'ok');
     } catch (e) {
       log('INIT FAILED: ' + (e && e.message ? e.message : e), 'err');
