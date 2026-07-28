@@ -31,7 +31,7 @@
   <script>
     // Bump this on every deploy so the on-screen log tells you which receiver the TV
     // actually loaded — GitHub Pages caching means "I pushed it" isn't "it's live".
-    var RECEIVER_BUILD = 'r13 (own idle timeout — a prep ping keeps us alive)';
+    var RECEIVER_BUILD = 'r14 (named error codes, pinned codec probe, own idle timeout)';
 
     // Declared up here (not beside the listener below) because log mirroring starts with the
     // very first boot line, long before the SDK wiring runs.
@@ -39,6 +39,11 @@
 
     var logEl = document.getElementById('log');
     var lines = [];
+    // Lines worth having no matter how long the receiver has been up: the codec probe is
+    // logged once at boot, and with a 20-line ring it had always rotated away by the time a
+    // sender attached and asked to replay — so "what does this TV actually decode?" was
+    // never answerable from the phone, which is half of every cast diagnosis.
+    var pinned = [];
     // Lines not yet delivered to the sender. Everything the receiver knows — the codec probe,
     // the LOAD interception, and above all the ERROR event's reason/detailedErrorCode — used to
     // exist ONLY as text painted on the TV, unreachable from the phone exactly when a failed
@@ -65,7 +70,7 @@
       var t = (Math.round(performance.now()) / 1000).toFixed(2);
       var line = { t: t, msg: String(msg), cls: cls || '' };
       lines.push(line);
-      if (lines.length > 20) lines.shift();
+      if (lines.length > 120) lines.shift();
       logEl.innerHTML = lines.map(function (l) {
         return '<div class="' + l.cls + '">' + l.t + '  ' +
           String(l.msg).replace(/</g, '&lt;') + '</div>';
@@ -134,6 +139,9 @@
       });
       log('decodes: ' + (yes.join(' ') || '(none)'), 'ok');
       log('rejects: ' + (no.join(' ') || '(none)'), no.length ? 'warn' : 'dim');
+      // Pinned: this is the answer to "can this TV play that codec at all", and a sender
+      // that attaches an hour after boot needs it as much as one that attaches at once.
+      pinned = lines.slice(-2);
     }
 
     // ---- idle lifetime (see opts.disableIdleTimeout at the bottom) --------------------
@@ -232,13 +240,56 @@
       } catch (e2) { /* best-effort */ }
     });
 
-    // The prize: the actual decode/network error. reason and detailedErrorCode are the
-    // two fields worth having — the numeric detailedErrorCode maps to a documented cause
-    // (e.g. 104 SEGMENT_NETWORK, 110 MEDIA_SRC_NOT_SUPPORTED, 314 MEDIA_DECODE).
+    // Numeric detailedErrorCode → the documented meaning. These were previously commented
+    // as "104 SEGMENT_NETWORK, 110 MEDIA_SRC_NOT_SUPPORTED, 314 MEDIA_DECODE" — all three
+    // wrong, and 104 is the one that actually turns up. A code read as a network fault when
+    // it means "the media element cannot play this source" sends the diagnosis to the wrong
+    // side of the wire, which is exactly what happened: six minutes of re-encoding spent on
+    // a file whose codec was never the objection.
+    var ERROR_NAMES = {
+      100: 'MEDIA_UNKNOWN', 101: 'MEDIA_ABORTED', 102: 'MEDIA_DECODE',
+      103: 'MEDIA_NETWORK', 104: 'MEDIA_SRC_NOT_SUPPORTED',
+      110: 'SOURCE_BUFFER_FAILURE',
+      201: 'MEDIAKEYS_NETWORK', 202: 'MEDIAKEYS_UNSUPPORTED', 203: 'MEDIAKEYS_WEBCRYPTO',
+      300: 'NETWORK_UNKNOWN', 301: 'SEGMENT_NETWORK',
+      311: 'HLS_NETWORK_MASTER_PLAYLIST', 312: 'HLS_NETWORK_PLAYLIST',
+      313: 'HLS_NETWORK_NO_KEY_RESPONSE', 314: 'HLS_NETWORK_KEY_LOAD',
+      315: 'HLS_NETWORK_INVALID_SEGMENT', 316: 'HLS_SEGMENT_PARSING',
+      321: 'DASH_NETWORK', 322: 'DASH_NO_INIT',
+      331: 'SMOOTH_NETWORK', 332: 'SMOOTH_NO_MEDIA_DATA',
+      411: 'HLS_MANIFEST_MASTER', 412: 'HLS_MANIFEST_PLAYLIST',
+      421: 'DASH_MANIFEST_NO_PERIODS', 422: 'DASH_MANIFEST_NO_MIMETYPE',
+      423: 'DASH_INVALID_SEGMENT_INFO', 431: 'SMOOTH_MANIFEST',
+      900: 'APP', 901: 'BREAK_CLIP_LOADING_ERROR', 902: 'BREAK_SEEK_INTERCEPTOR_ERROR',
+      903: 'IMAGE_ERROR', 904: 'LOAD_INTERRUPTED', 905: 'LOAD_FAILED',
+      906: 'MEDIA_ERROR_MESSAGE', 909: 'GENERIC'
+    };
+
+    // The network codes are documented as carrying an appended network code and HTTP status
+    // ({ErrorCode}{NetworkErrorCode}{HTTPStatusCode}), so a real failure can arrive as e.g.
+    // 3010404 rather than 301. Decode the leading code and keep the tail — for a receiver
+    // pulling from a phone over HTTP, the status on the end is often the whole story.
+    function errorName(code) {
+      if (ERROR_NAMES[code]) return ERROR_NAMES[code];
+      var s = String(code);
+      for (var len = 3; len <= 3 && s.length > len; len++) {
+        var head = ERROR_NAMES[Number(s.slice(0, len))];
+        if (head) return head + ' +' + s.slice(len);
+      }
+      return 'UNKNOWN';
+    }
+    // The prize: the actual failure. The numeric code is the only precise thing here, so it
+    // is named in the line AND sent as a structured message the sender can reason about
+    // instead of scraping this text.
     on('ERROR', function (e) {
-      log('ERROR reason=' + e.reason +
-          ' detailedCode=' + e.detailedErrorCode +
+      var code = e.detailedErrorCode;
+      var name = errorName(code);
+      log('ERROR ' + name + ' (' + code + ') reason=' + e.reason +
           (e.error ? ' error=' + JSON.stringify(e.error) : ''), 'err');
+      try {
+        ctx.sendCustomMessage(DEBUG_NAMESPACE, undefined,
+          { err: { code: code, name: name, reason: String(e.reason) } });
+      } catch (x) { /* the sender may already be gone */ }
     });
 
     // Let the Casper sender show/hide this on-screen log over a custom channel. Hidden by
@@ -260,6 +311,7 @@
         // A sender that attached late (the receiver boots, probes codecs and logs the load
         // before the app's session object exists) asks for the history it missed.
         if (d.replay === true) {
+          pinned.forEach(function (l) { pending.push(l); });
           lines.forEach(function (l) { pending.push(l); });
           flush();
         }
