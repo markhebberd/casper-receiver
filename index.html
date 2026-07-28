@@ -31,7 +31,7 @@
   <script>
     // Bump this on every deploy so the on-screen log tells you which receiver the TV
     // actually loaded — GitHub Pages caching means "I pushed it" isn't "it's live".
-    var RECEIVER_BUILD = 'r12 (log mirrored to the sender, prep pings)';
+    var RECEIVER_BUILD = 'r13 (own idle timeout — a prep ping keeps us alive)';
 
     // Declared up here (not beside the listener below) because log mirroring starts with the
     // very first boot line, long before the SDK wiring runs.
@@ -136,6 +136,34 @@
       log('rejects: ' + (no.join(' ') || '(none)'), no.length ? 'warn' : 'dim');
     }
 
+    // ---- idle lifetime (see opts.disableIdleTimeout at the bottom) --------------------
+    // Ours to enforce now, and the one thing it must do differently from the SDK's version:
+    // treat a prep ping as activity. A remux or convert can run for many minutes with
+    // nothing loaded here, and that wait is the sender working, not the TV being abandoned.
+    // Without a ping for IDLE_GRACE_MS the app still gives the screen back, so a sender that
+    // crashes or walks away doesn't strand the TV on a black receiver forever.
+    var IDLE_GRACE_MS = 5 * 60 * 1000;
+    var IDLE_CHECK_MS = 15 * 1000;
+    var lastActivity = Date.now();
+    function touchIdle() { lastActivity = Date.now(); }
+
+    function idleCheck() {
+      try {
+        // Any state but IDLE is playing, paused or loading — all of them are activity.
+        // Enum values are strings; fall back to the literal if this SDK build lacks it.
+        var idle = (cast.framework.messages && cast.framework.messages.PlayerState &&
+                    cast.framework.messages.PlayerState.IDLE) || 'IDLE';
+        var state = (typeof pm.getPlayerState === 'function') ? pm.getPlayerState() : null;
+        if (state && state !== idle) { touchIdle(); return; }
+        var quiet = Date.now() - lastActivity;
+        if (quiet >= IDLE_GRACE_MS) {
+          log('idle ' + Math.round(quiet / 1000) + 's with no playback and no prep ping — ' +
+              'shutting down', 'warn');
+          ctx.stop();
+        }
+      } catch (e) { /* a watchdog must never be the thing that breaks playback */ }
+    }
+
     // Surface what the sender actually asks us to load — including declared codecs, so a
     // sender/receiver codec mismatch is visible without decoding a single frame.
     pm.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, function (req) {
@@ -173,10 +201,15 @@
 
     // Player state transitions — this is what "buffering forever" would show.
     on('PLAYER_STATE_CHANGED', function (e) {
+      if (e.playerState !== 'IDLE') touchIdle();
       log('state=' + e.playerState, e.playerState === 'PLAYING' ? 'ok' : '');
     });
     on('MEDIA_STATUS', function (e) {
       var s = e.mediaStatus || {};
+      // Belt and braces for [idleCheck]: this fires throughout playback, so even an SDK
+      // build without getPlayerState can't have the watchdog stop a playing video. Only a
+      // NON-idle state counts, or a status repeated while idle would defeat the timeout.
+      if (s.playerState && s.playerState !== 'IDLE') touchIdle();
       if (s.playerState) log('status=' + s.playerState +
         (s.idleReason ? ' idle=' + s.idleReason : ''),
         s.idleReason && s.idleReason !== 'FINISHED' ? 'warn' : '');
@@ -223,7 +256,7 @@
         // can run for many minutes. Logged (and so timestamped on this side too) so a receiver
         // that goes away mid-preparation is provably distinguishable from one that never heard
         // from the sender again.
-        if (typeof d.prep === 'string') log('sender: ' + d.prep, 'dim');
+        if (typeof d.prep === 'string') { touchIdle(); log('sender: ' + d.prep, 'dim'); }
         // A sender that attached late (the receiver boots, probes codecs and logs the load
         // before the app's session object exists) asks for the history it missed.
         if (d.replay === true) {
@@ -235,12 +268,20 @@
 
     var opts = new cast.framework.CastReceiverOptions();
     opts.maxInactivity = 3600;               // don't tear down while we debug
+    // maxInactivity governs the SENDER CONNECTION, not this app's own life. The receiver
+    // stops itself about five minutes after playback stops, and a custom message is not
+    // playback — so a sender spending six minutes converting an HEVC file pinged us every
+    // 15s and was torn down underneath it anyway (r12 trace: booted, never got playable
+    // media, session gone 311s later mid-convert). disableIdleTimeout hands the decision to
+    // us; idleCheck below is that timeout, reimplemented so a prep ping counts as activity.
+    opts.disableIdleTimeout = true;
     opts.customNamespaces = { };
     opts.customNamespaces[DEBUG_NAMESPACE] = cast.framework.system.MessageType.JSON;
     log('receiver starting… ' + RECEIVER_BUILD, 'ok');
     probeCodecs();
     ctx.start(opts);
     started = true;
+    setInterval(idleCheck, IDLE_CHECK_MS);
     // Anything logged during boot (codec probe included) goes out as soon as a sender attaches.
     try {
       ctx.addEventListener(cast.framework.system.EventType.SENDER_CONNECTED, flush);
