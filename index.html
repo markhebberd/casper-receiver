@@ -31,7 +31,7 @@
   <script>
     // Bump this on every deploy so the on-screen log tells you which receiver the TV
     // actually loaded — GitHub Pages caching means "I pushed it" isn't "it's live".
-    var RECEIVER_BUILD = 'r14 (named error codes, pinned codec probe, own idle timeout)';
+    var RECEIVER_BUILD = 'r15 (profile/level codec probe, canPlay query)';
 
     // Declared up here (not beside the listener below) because log mirroring starts with the
     // very first boot line, long before the SDK wiring runs.
@@ -120,9 +120,22 @@
         log('canDisplayType unavailable — cannot probe codecs', 'warn');
         return;
       }
+      // Profile and level, not just the codec family. "HEVC" alone is close to meaningless:
+      // the old list asked only about hev1.1.6.L93.B0 — Main profile, level 3.1, 8-bit — and
+      // answered "decodes: HEVC" for a device that then refused a 1080p Main10 L4 file. Every
+      // 1080p x265 release is in the bottom half of this list, so the exact row that says no
+      // IS the diagnosis. Level numbers are 30x: L93=3.1, L120=4.0, L123=4.1, L150=5.0.
       var probes = [
-        ['H.264',  'video/mp4',  'avc1.640028'],
-        ['HEVC',   'video/mp4',  'hev1.1.6.L93.B0'],
+        ['H.264/High@4.0',   'video/mp4',  'avc1.640028'],
+        ['H.264/High@4.1',   'video/mp4',  'avc1.640029'],
+        ['H.264/High@5.1',   'video/mp4',  'avc1.640033'],
+        ['HEVC/Main@3.1',    'video/mp4',  'hev1.1.6.L93.B0'],
+        ['HEVC/Main@4.0',    'video/mp4',  'hvc1.1.6.L120.B0'],
+        ['HEVC/Main@4.1',    'video/mp4',  'hvc1.1.6.L123.B0'],
+        ['HEVC/Main10@4.0',  'video/mp4',  'hvc1.2.4.L120.B0'],
+        ['HEVC/Main10@4.1',  'video/mp4',  'hvc1.2.4.L123.B0'],
+        ['HEVC/Main10@5.0',  'video/mp4',  'hvc1.2.4.L150.B0'],
+        ['HEVC/Main10@4.0(hev1)', 'video/mp4', 'hev1.2.4.L120.B0'],
         ['VP9',    'video/webm', 'vp9'],
         ['AV1',    'video/mp4',  'av01.0.05M.08'],
         ['AAC',    'audio/mp4',  'mp4a.40.2'],
@@ -308,6 +321,20 @@
         // that goes away mid-preparation is provably distinguishable from one that never heard
         // from the sender again.
         if (typeof d.prep === 'string') { touchIdle(); log('sender: ' + d.prep, 'dim'); }
+        // "Can you play THIS?" — the sender naming the actual contentType/codecs of the file
+        // it is about to cast. A static table can only ever approximate; this asks the device
+        // about the exact stream, and the answer comes back over the same channel.
+        if (d.canPlay && typeof d.canPlay.codecs === 'string') {
+          var ct = d.canPlay.contentType || 'video/mp4';
+          var ok = false;
+          try { ok = ctx.canDisplayType(ct, d.canPlay.codecs); } catch (e) { ok = false; }
+          log('canDisplayType(' + ct + ', ' + d.canPlay.codecs + ') = ' + ok,
+              ok ? 'ok' : 'err');
+          try {
+            ctx.sendCustomMessage(DEBUG_NAMESPACE, undefined,
+              { canPlayResult: { codecs: d.canPlay.codecs, contentType: ct, ok: ok } });
+          } catch (x) { /* sender gone */ }
+        }
         // A sender that attached late (the receiver boots, probes codecs and logs the load
         // before the app's session object exists) asks for the history it missed.
         if (d.replay === true) {
