@@ -31,7 +31,7 @@
   <script>
     // Bump this on every deploy so the on-screen log tells you which receiver the TV
     // actually loaded — GitHub Pages caching means "I pushed it" isn't "it's live".
-    var RECEIVER_BUILD = 'r15 (profile/level codec probe, canPlay query)';
+    var RECEIVER_BUILD = 'r16 (codec probe as structured caps, canPlay query)';
 
     // Declared up here (not beside the listener below) because log mirroring starts with the
     // very first boot line, long before the SDK wiring runs.
@@ -44,6 +44,13 @@
     // sender attached and asked to replay — so "what does this TV actually decode?" was
     // never answerable from the phone, which is half of every cast diagnosis.
     var pinned = [];
+    // The codec probe as structured data, resent whenever a sender attaches — it is the basis
+    // for the sender's routing decisions, so it must survive the sender connecting late.
+    var caps = null;
+    function sendCaps() {
+      if (!caps || typeof ctx === 'undefined' || !ctx) return;
+      try { ctx.sendCustomMessage(DEBUG_NAMESPACE, undefined, { caps: caps }); } catch (e) { }
+    }
     // Lines not yet delivered to the sender. Everything the receiver knows — the codec probe,
     // the LOAD interception, and above all the ERROR event's reason/detailedErrorCode — used to
     // exist ONLY as text painted on the TV, unreachable from the phone exactly when a failed
@@ -144,14 +151,21 @@
         ['FLAC',   'audio/mp4',  'fLaC'],
         ['Opus',   'audio/webm', 'opus']
       ];
-      var yes = [], no = [];
+      var yes = [], no = [], results = {};
       probes.forEach(function (p) {
         var ok = false;
         try { ok = ctx.canDisplayType(p[1], p[2]); } catch (e) { ok = false; }
+        results[p[0]] = ok;
         (ok ? yes : no).push(p[0]);
       });
       log('decodes: ' + (yes.join(' ') || '(none)'), 'ok');
       log('rejects: ' + (no.join(' ') || '(none)'), no.length ? 'warn' : 'dim');
+      // The same answers as structured data. The sender has to make routing decisions from
+      // this (hev1 needs repackaging for one Chromecast on this network and not for another),
+      // and scraping them out of a log line would be both fragile and too late.
+      caps = {};
+      probes.forEach(function (p) { caps[p[0]] = results[p[0]]; });
+      sendCaps();
       // Pinned: this is the answer to "can this TV play that codec at all", and a sender
       // that attaches an hour after boot needs it as much as one that attaches at once.
       pinned = lines.slice(-2);
@@ -338,6 +352,7 @@
         // A sender that attached late (the receiver boots, probes codecs and logs the load
         // before the app's session object exists) asks for the history it missed.
         if (d.replay === true) {
+          sendCaps();
           pinned.forEach(function (l) { pending.push(l); });
           lines.forEach(function (l) { pending.push(l); });
           flush();
@@ -363,7 +378,9 @@
     setInterval(idleCheck, IDLE_CHECK_MS);
     // Anything logged during boot (codec probe included) goes out as soon as a sender attaches.
     try {
-      ctx.addEventListener(cast.framework.system.EventType.SENDER_CONNECTED, flush);
+      ctx.addEventListener(cast.framework.system.EventType.SENDER_CONNECTED, function () {
+        flush(); sendCaps();
+      });
     } catch (e) { log('sender-connected hook unavailable: ' + e, 'warn'); }
     setInterval(flush, 2000);   // safety net: nothing stays stuck in the buffer
     log('receiver started', 'ok');
