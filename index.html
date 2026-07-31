@@ -31,7 +31,7 @@
   <script>
     // Bump this on every deploy so the on-screen log tells you which receiver the TV
     // actually loaded — GitHub Pages caching means "I pushed it" isn't "it's live".
-    var RECEIVER_BUILD = 'r16 (codec probe as structured caps, canPlay query)';
+    var RECEIVER_BUILD = 'r17 (log status changes only, structured caps)';
 
     // Declared up here (not beside the listener below) because log mirroring starts with the
     // very first boot line, long before the SDK wiring runs.
@@ -47,6 +47,8 @@
     // The codec probe as structured data, resent whenever a sender attaches — it is the basis
     // for the sender's routing decisions, so it must survive the sender connecting late.
     var caps = null;
+    /** Last status line logged, so MEDIA_STATUS records transitions rather than every tick. */
+    var lastStatusLine = null;
     function sendCaps() {
       if (!caps || typeof ctx === 'undefined' || !ctx) return;
       try { ctx.sendCustomMessage(DEBUG_NAMESPACE, undefined, { caps: caps }); } catch (e) { }
@@ -245,9 +247,19 @@
       // build without getPlayerState can't have the watchdog stop a playing video. Only a
       // NON-idle state counts, or a status repeated while idle would defeat the timeout.
       if (s.playerState && s.playerState !== 'IDLE') touchIdle();
-      if (s.playerState) log('status=' + s.playerState +
-        (s.idleReason ? ' idle=' + s.idleReason : ''),
-        s.idleReason && s.idleReason !== 'FINISHED' ? 'warn' : '');
+      // Log CHANGES only. MEDIA_STATUS fires continuously — a paused video emits it several
+      // times a second — and since the log ring grew to 120 lines (r14, so the codec probe
+      // would survive to be replayed) that meant every replay dumped a hundred identical
+      // "status=PAUSED" lines into the sender's cast trace, burying the boot probe, the LOAD
+      // and the error it exists to show. The state transitions are the diagnostic; the
+      // repeats are noise.
+      if (s.playerState) {
+        var line = 'status=' + s.playerState + (s.idleReason ? ' idle=' + s.idleReason : '');
+        if (line !== lastStatusLine) {
+          lastStatusLine = line;
+          log(line, s.idleReason && s.idleReason !== 'FINISHED' ? 'warn' : '');
+        }
+      }
     });
     on('BUFFERING', function (e) {
       log('buffering=' + e.isBuffering, e.isBuffering ? 'dim' : '');
