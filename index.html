@@ -31,7 +31,7 @@
   <script>
     // Bump this on every deploy so the on-screen log tells you which receiver the TV
     // actually loaded — GitHub Pages caching means "I pushed it" isn't "it's live".
-    var RECEIVER_BUILD = 'r17 (log status changes only, structured caps)';
+    var RECEIVER_BUILD = 'r18 (video render watchdog)';
 
     // Declared up here (not beside the listener below) because log mirroring starts with the
     // very first boot line, long before the SDK wiring runs.
@@ -201,9 +201,80 @@
       } catch (e) { /* a watchdog must never be the thing that breaks playback */ }
     }
 
+    // ---- video render watchdog -------------------------------------------------------
+    // "PLAYING" means the media element's clock is advancing, and AUDIO ALONE advances it. A
+    // receiver that is decoding no video — sound playing while the TV sits on its own home
+    // screen — reports itself perfectly healthy, and every diagnostic we have believes it: the
+    // trace shows BUFFERING → PLAYING, no error, and a load that reads as a success. Nothing on
+    // either side of the wire could tell that case from a working cast. The decoder's own frame
+    // counter can, so watch that instead of the player state.
+    var RENDER_CHECK_MS = 2000;
+    var RENDER_GRACE_MS = 10000;   // decoding starts after the first buffer; don't cry early
+    var renderPrevTime = -1;       // media clock at the previous check
+    var renderSince = 0;           // when the clock started advancing without interruption
+    var renderBaseFrames = -1;     // decoded-frame count when that run started
+    var renderReported = false;
+
+    function videoElement() {
+      try { return document.getElementsByTagName('video')[0] || null; } catch (e) { return null; }
+    }
+
+    /** Frames the decoder has produced, or -1 when this build won't say. */
+    function decodedFrames(v) {
+      try {
+        if (typeof v.getVideoPlaybackQuality === 'function') {
+          var q = v.getVideoPlaybackQuality();
+          if (q && typeof q.totalVideoFrames === 'number') return q.totalVideoFrames;
+        }
+      } catch (e) { }
+      return (typeof v.webkitDecodedFrameCount === 'number') ? v.webkitDecodedFrameCount : -1;
+    }
+
+    function renderCheck() {
+      try {
+        if (renderReported) return;
+        var v = videoElement();
+        if (!v) return;
+        // Only meaningful for media that is supposed to have a picture at all.
+        var info = (typeof pm.getMediaInformation === 'function' && pm.getMediaInformation()) || {};
+        if (info.contentType && info.contentType.indexOf('video/') !== 0) return;
+
+        var t = v.currentTime;
+        var advancing = (renderPrevTime >= 0 && t > renderPrevTime + 0.1);
+        renderPrevTime = t;
+        // Paused, buffering or stalled is not the condition we're looking for — only a clock
+        // that is genuinely running says "this is playing" loudly enough to be worth doubting.
+        if (!advancing) { renderSince = 0; return; }
+        var frames = decodedFrames(v);
+        if (!renderSince) { renderSince = Date.now(); renderBaseFrames = frames; return; }
+        if (Date.now() - renderSince < RENDER_GRACE_MS) return;
+
+        var noSize = (v.videoWidth === 0 || v.videoHeight === 0);
+        var noFrames = (frames >= 0 && renderBaseFrames >= 0 && frames === renderBaseFrames);
+        // A build that reports neither dimensions nor frame counts stays quiet rather than
+        // guessing — a false "no video" would be worse than the silence it replaces.
+        if (!noSize && !noFrames) return;
+        renderReported = true;
+        log('AUDIO ONLY: the media clock is advancing (' + t.toFixed(1) + 's) but ' +
+            (noSize ? 'the video track has no dimensions' : 'the decoder produced no new frames') +
+            ' — ' + v.videoWidth + 'x' + v.videoHeight + ' frames=' + frames +
+            '. Sound is playing with no picture.', 'err');
+        try {
+          ctx.sendCustomMessage(DEBUG_NAMESPACE, undefined, {
+            render: {
+              video: false, width: v.videoWidth, height: v.videoHeight,
+              frames: frames, mediaTime: Math.round(t)
+            }
+          });
+        } catch (e) { }
+      } catch (e) { /* a watchdog must never be the thing that breaks playback */ }
+    }
+
     // Surface what the sender actually asks us to load — including declared codecs, so a
     // sender/receiver codec mismatch is visible without decoding a single frame.
     pm.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, function (req) {
+      // Re-arm the render watchdog: a new load gets its own verdict.
+      renderReported = false; renderPrevTime = -1; renderSince = 0; renderBaseFrames = -1;
       try {
         var m = req.media || {};
         var tracks = m.tracks || [];
@@ -388,6 +459,7 @@
     ctx.start(opts);
     started = true;
     setInterval(idleCheck, IDLE_CHECK_MS);
+    setInterval(renderCheck, RENDER_CHECK_MS);
     // Anything logged during boot (codec probe included) goes out as soon as a sender attaches.
     try {
       ctx.addEventListener(cast.framework.system.EventType.SENDER_CONNECTED, function () {
