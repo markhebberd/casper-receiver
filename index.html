@@ -31,7 +31,7 @@
   <script>
     // Bump this on every deploy so the on-screen log tells you which receiver the TV
     // actually loaded — GitHub Pages caching means "I pushed it" isn't "it's live".
-    var RECEIVER_BUILD = 'r18 (video render watchdog)';
+    var RECEIVER_BUILD = 'r19 (media log on change only)';
 
     // Declared up here (not beside the listener below) because log mirroring starts with the
     // very first boot line, long before the SDK wiring runs.
@@ -340,13 +340,24 @@
     // manager's own media information — the event's mediaInformation field is often absent
     // or sparse, which previously printed a misleading "type=undefined dur=?" even when the
     // load carried a full MediaInfo.
+    //
+    // Logged when the media CHANGES, not on every event: a growing fast-start stream's duration
+    // rises as the phone muxes, firing this several times a second — hundreds of identical
+    // "media: type=video/mp4 dur=…" lines that buried the seek and the error in the sender's
+    // trace (the same flood r17 fixed for MEDIA_STATUS). A new type, or a duration that went
+    // DOWN (a new load: a seek-restart begins a shorter stream), is a change worth a line.
+    var lastMediaKey = null, lastMediaDur = null;
     on('MEDIA_INFORMATION_CHANGED', function (e) {
       try {
         var info = pm.getMediaInformation() || e.mediaInformation || {};
         var hls = info.hlsSegmentFormat || info.hlsVideoSegmentFormat;
-        log('media: type=' + info.contentType +
-            (hls ? ' hls=' + hls : '') +
-            ' dur=' + (info.duration != null ? info.duration.toFixed(1) + 's' : '?'), 'dim');
+        var key = 'media: type=' + info.contentType + (hls ? ' hls=' + hls : '');
+        var dur = info.duration;
+        var reloaded = dur != null && lastMediaDur != null && dur < lastMediaDur;
+        lastMediaDur = dur;
+        if (key === lastMediaKey && !reloaded) return;
+        lastMediaKey = key;
+        log(key + ' dur=' + (dur != null ? dur.toFixed(1) + 's' : '?'), 'dim');
       } catch (e2) { /* best-effort */ }
     });
 
