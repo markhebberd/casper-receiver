@@ -13,10 +13,14 @@
     html, body { margin: 0; height: 100%; background: #000; color: #eee;
                  font-family: monospace; overflow: hidden; }
     cast-media-player { position: absolute; inset: 0; }
+    /* Picture subtitles (PGS): placed over the video's picture area by imgSubTick. */
+    #imgsubs { position: absolute; pointer-events: none; z-index: 5; }
+    #imgsubs img { position: absolute; }
     /* On-screen log overlay — so the TV itself shows what happened (no chrome://inspect needed). */
     /* Hidden by default (r9): the sender's Now Playing toggle shows it via {showLog:true}.
        Lines are still collected while hidden, so toggling on reveals the full history. */
     #log { display: none; position: absolute; left: 0; right: 0; bottom: 0; max-height: 55%;
+           z-index: 10;
            overflow: hidden; padding: 12px 16px; font-size: 20px; line-height: 1.35;
            background: rgba(0,0,0,0.72); white-space: pre-wrap; word-break: break-all; }
     .err  { color: #ff6b6b; }
@@ -27,11 +31,12 @@
 </head>
 <body>
   <cast-media-player></cast-media-player>
+  <div id="imgsubs"></div>
   <div id="log"></div>
   <script>
     // Bump this on every deploy so the on-screen log tells you which receiver the TV
     // actually loaded — GitHub Pages caching means "I pushed it" isn't "it's live".
-    var RECEIVER_BUILD = 'r19 (media log on change only)';
+    var RECEIVER_BUILD = 'r20 (picture subtitles)';
 
     // Declared up here (not beside the listener below) because log mirroring starts with the
     // very first boot line, long before the SDK wiring runs.
@@ -270,6 +275,136 @@
       } catch (e) { /* a watchdog must never be the thing that breaks playback */ }
     }
 
+    // ---- picture subtitles (PGS / VobSub) ---------------------------------------------
+    // Blu-ray subtitles are bitmaps, which WebVTT can't carry. The sender serves each line as
+    // a PNG with its place in the frame, listed in a JSON index, and declares the track as an
+    // EMPTY VTT so it's still an ordinary switchable track. While that track is active, we
+    // draw its pictures ourselves. LOAD customData.imageSubs: [{trackId, url, offsetMs}] —
+    // index times are source time; a seek-restarted stream's clock starts at offsetMs.
+    var imgSubsEl = document.getElementById('imgsubs');
+    var imgSubs = {};          // trackId → { url, offsetMs, events, loading, retryAt }
+    var activeTrackIds = [];   // what the sender last asked for (LOAD / EDIT_TRACKS_INFO)
+    var imgShown = null;       // the event currently on screen
+
+    function setImageSubs(list) {
+      imgSubs = {};
+      showImageEvent(null);
+      (list || []).forEach(function (s) {
+        imgSubs[s.trackId] = { url: s.url, offsetMs: s.offsetMs || 0, events: null,
+                               loading: false, retryAt: 0 };
+      });
+    }
+
+    function activeImageSub() {
+      for (var i = 0; i < activeTrackIds.length; i++) {
+        if (imgSubs[activeTrackIds[i]]) return imgSubs[activeTrackIds[i]];
+      }
+      return null;
+    }
+
+    function loadImageIndex(s) {
+      s.loading = true;
+      var x = new XMLHttpRequest();
+      x.open('GET', s.url);
+      x.onload = function () {
+        try {
+          s.events = JSON.parse(x.responseText).events || [];
+          log('picture subtitles: ' + s.events.length + ' lines', 'dim');
+        } catch (e) {
+          s.events = [];
+          log('picture subtitles: unreadable index: ' + e, 'err');
+        }
+      };
+      // Retry, but not every tick: the phone may be busy or briefly unreachable.
+      x.onerror = function () {
+        s.loading = false; s.retryAt = Date.now() + 5000;
+        log('picture subtitles: index fetch failed — retrying', 'warn');
+      };
+      x.send();
+    }
+
+    /** Index of the event on screen at [ms] (events are sorted by start), or -1. */
+    function imageEventAt(events, ms) {
+      var lo = 0, hi = events.length - 1, found = -1;
+      while (lo <= hi) {
+        var mid = (lo + hi) >> 1;
+        if (events[mid].s <= ms) { found = mid; lo = mid + 1; } else { hi = mid - 1; }
+      }
+      return (found >= 0 && ms < events[found].e) ? found : -1;
+    }
+
+    /** The rectangle the picture actually occupies: the player box, letterboxed. */
+    function videoRect() {
+      var v = videoElement();
+      var r = { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight };
+      if (v) {
+        var b = v.getBoundingClientRect();
+        if (b.width > 0 && b.height > 0) r = { left: b.left, top: b.top, width: b.width, height: b.height };
+      }
+      var vw = (v && v.videoWidth) || 16, vh = (v && v.videoHeight) || 9;
+      var scale = Math.min(r.width / vw, r.height / vh);
+      var w = vw * scale, h = vh * scale;
+      return { left: r.left + (r.width - w) / 2, top: r.top + (r.height - h) / 2, width: w, height: h };
+    }
+
+    function showImageEvent(ev) {
+      if (ev === imgShown) return;
+      imgShown = ev;
+      imgSubsEl.innerHTML = '';
+      if (!ev) return;
+      ev.p.forEach(function (p) {
+        var img = document.createElement('img');
+        img.src = p.u;
+        img.style.left = (p.x * 100) + '%';
+        img.style.top = (p.y * 100) + '%';
+        img.style.width = (p.w * 100) + '%';
+        img.style.height = (p.h * 100) + '%';
+        imgSubsEl.appendChild(img);
+      });
+    }
+
+    function imgSubTick() {
+      try {
+        var s = activeImageSub();
+        var ev = null;
+        if (s) {
+          if (!s.events && !s.loading && Date.now() >= s.retryAt) loadImageIndex(s);
+          var idle = (typeof pm.getPlayerState === 'function') && pm.getPlayerState() === 'IDLE';
+          if (s.events && !idle) {
+            var v = videoElement();
+            var t = (typeof pm.getCurrentTimeSec === 'function') ? pm.getCurrentTimeSec()
+                : (v ? v.currentTime : 0);
+            var i = imageEventAt(s.events, t * 1000 + s.offsetMs);
+            if (i >= 0) {
+              ev = s.events[i];
+              // Fetch the next line's pictures now, so it doesn't flash in late.
+              var next = s.events[i + 1];
+              if (next && !next.pre) {
+                next.pre = true;
+                next.p.forEach(function (p) { new Image().src = p.u; });
+              }
+            }
+          }
+        }
+        showImageEvent(ev);
+        if (ev) {
+          var r = videoRect();
+          imgSubsEl.style.left = r.left + 'px';
+          imgSubsEl.style.top = r.top + 'px';
+          imgSubsEl.style.width = r.width + 'px';
+          imgSubsEl.style.height = r.height + 'px';
+        }
+      } catch (e) { /* subtitles must never be the thing that breaks playback */ }
+    }
+
+    // The sender switching tracks mid-cast (or turning subtitles off).
+    if (cast.framework.messages.MessageType.EDIT_TRACKS_INFO) {
+      pm.setMessageInterceptor(cast.framework.messages.MessageType.EDIT_TRACKS_INFO, function (req) {
+        if (req && req.activeTrackIds) activeTrackIds = req.activeTrackIds;
+        return req;
+      });
+    }
+
     // Surface what the sender actually asks us to load — including declared codecs, so a
     // sender/receiver codec mismatch is visible without decoding a single frame.
     pm.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, function (req) {
@@ -289,6 +424,14 @@
           log('  track#' + tr.trackId + ' ' + tr.type + '/' + tr.subtype +
               ' ' + (tr.trackContentType || '') + ' ' + (tr.language || ''), 'dim');
         });
+        activeTrackIds = req.activeTrackIds || [];
+        var imageSubs = m.customData && m.customData.imageSubs;
+        setImageSubs(imageSubs);
+        if (imageSubs && imageSubs.length) {
+          log('  picture subtitles on track(s) ' +
+              imageSubs.map(function (x) { return x.trackId; }).join(',') +
+              ' offset=' + (imageSubs[0].offsetMs || 0) + 'ms', 'dim');
+        }
       } catch (e) { log('LOAD (unparsable): ' + e, 'warn'); }
       return req;
     });
@@ -471,6 +614,7 @@
     started = true;
     setInterval(idleCheck, IDLE_CHECK_MS);
     setInterval(renderCheck, RENDER_CHECK_MS);
+    setInterval(imgSubTick, 100);
     // Anything logged during boot (codec probe included) goes out as soon as a sender attaches.
     try {
       ctx.addEventListener(cast.framework.system.EventType.SENDER_CONNECTED, function () {
