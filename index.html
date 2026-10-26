@@ -45,7 +45,7 @@
   <script>
     // Bump this on every deploy so the on-screen log tells you which receiver the TV
     // actually loaded — GitHub Pages caching means "I pushed it" isn't "it's live".
-    var RECEIVER_BUILD = 'r21 (text subtitles drawn by the receiver)';
+    var RECEIVER_BUILD = 'r22 (text subtitles drawn from the TV\'s own track)';
 
     // Declared up here (not beside the listener below) because log mirroring starts with the
     // very first boot line, long before the SDK wiring runs.
@@ -407,41 +407,24 @@
     }
 
     // ---- text subtitles (WebVTT) --------------------------------------------------------
-    // Drawn here too, not by the media element: its cues only change on timeupdate events
-    // (every 250ms or more), so lines came up to half a second late, and some TVs (LG webOS)
-    // ignore the sender's text style and draw white on a black box. The sender's VTT is
-    // already shifted to the stream's clock, so cue times compare with currentTime directly.
-    // CAF is never told these tracks are active, so it draws nothing of its own.
+    // Drawn here, not by the media element: its cues only change on timeupdate events (every
+    // 250ms or more), so lines came up to half a second late, and some TVs ignore the sender's
+    // text style and draw white on a black box. The TV still loads each track itself, as it
+    // always has; this sets the track it turns on to "hidden" — loaded, not drawn — and draws
+    // that track's cues against the clock every 40ms. Where the media element can't be
+    // reached, nothing is hidden and the TV's own subtitles show as before.
     var textSubsEl = document.getElementById('textsubs');
-    var textSubs = {};         // trackId → { url, cues, loading, retryAt }
     var textShownKey = null;   // what is on screen, to touch the DOM only on a change
+    var textLogged = null;     // the track last reported in the log
 
-    function setTextSubs(tracks) {
-      textSubs = {};
-      showTextCues([]);
-      (tracks || []).forEach(function (tr) {
-        if (tr.type === 'TEXT' && tr.trackContentId && !imgSubs[tr.trackId]) {
-          textSubs[tr.trackId] = { url: tr.trackContentId, cues: null, loading: false, retryAt: 0 };
-        }
-      });
-    }
-
-    /** The active track ids with the ones drawn here taken out: what CAF is told. */
-    function withoutDrawnTracks(ids) {
-      return (ids || []).filter(function (id) { return !textSubs[id] && !imgSubs[id]; });
-    }
-
-    function activeTextSub() {
-      for (var i = 0; i < activeTrackIds.length; i++) {
-        if (textSubs[activeTrackIds[i]]) return textSubs[activeTrackIds[i]];
-      }
-      return null;
-    }
-
-    function vttMs(t) {
-      var p = t.split(':'), sec = parseFloat(p.pop()), min = parseInt(p.pop() || '0', 10),
-          hr = parseInt(p.pop() || '0', 10);
-      return Math.round(((hr * 60 + min) * 60 + sec) * 1000);
+    /** The page's media element, wherever CAF put it. */
+    function mediaElement() {
+      var v = videoElement();
+      if (v) return v;
+      try {
+        var p = document.getElementsByTagName('cast-media-player')[0];
+        return (p && p.shadowRoot && p.shadowRoot.querySelector('video')) || null;
+      } catch (e) { return null; }
     }
 
     /** Cue text as HTML: <i>/<b>/<u> kept, any other tag dropped, the rest escaped. */
@@ -454,73 +437,46 @@
       }).join('');
     }
 
-    function parseVtt(body) {
-      var cues = [];
-      body.replace(/\r/g, '').split(/\n\s*\n/).forEach(function (block) {
-        var lines = block.split('\n');
-        for (var i = 0; i < lines.length; i++) {
-          var m = /^\s*([\d:.]+)\s+-->\s+([\d:.]+)/.exec(lines[i]);
-          if (m) {
-            var text = lines.slice(i + 1).join('\n').trim();
-            if (text) cues.push({ s: vttMs(m[1]), e: vttMs(m[2]), h: cueHtml(text) });
-            return;
-          }
-        }
-      });
-      cues.sort(function (a, b) { return a.s - b.s; });
-      return cues;
-    }
-
-    function loadTextSub(s) {
-      s.loading = true;
-      var x = new XMLHttpRequest();
-      x.open('GET', s.url);
-      x.onload = function () {
-        s.cues = (x.status >= 200 && x.status < 300) ? parseVtt(x.responseText || '') : null;
-        if (s.cues) log('text subtitles: ' + s.cues.length + ' lines', 'dim');
-        else { s.loading = false; s.retryAt = Date.now() + 5000; }
-      };
-      x.onerror = function () {
-        s.loading = false; s.retryAt = Date.now() + 5000;
-        log('text subtitles: fetch failed — retrying', 'warn');
-      };
-      x.send();
-    }
-
-    /** Every cue on screen at [ms]: overlapping lines (a sign over dialogue) show together. */
-    function textCuesAt(cues, ms) {
-      var lo = 0, hi = cues.length - 1, last = -1;
-      while (lo <= hi) {
-        var mid = (lo + hi) >> 1;
-        if (cues[mid].s <= ms) { last = mid; lo = mid + 1; } else { hi = mid - 1; }
+    /** The track to draw: one the TV turned on (hidden here at once), or one hidden earlier. */
+    function drawnTextTrack(v) {
+      var list = v.textTracks, found = null;
+      for (var i = 0; list && i < list.length; i++) {
+        var t = list[i];
+        if (t.kind !== 'subtitles' && t.kind !== 'captions') continue;
+        if (t.mode === 'showing') { t.mode = 'hidden'; t.castkitDrawn = true; }
+        if (t.mode === 'hidden' && t.castkitDrawn && !found) found = t;
       }
-      var on = [];
-      // Cues are sorted by start; a long one can still be running behind shorter ones.
-      for (var i = last; i >= 0 && i > last - 20; i--) if (ms < cues[i].e) on.unshift(cues[i]);
-      return on;
+      return found;
     }
 
     function showTextCues(on) {
-      var key = on.map(function (c) { return c.s + ':' + c.e; }).join(',');
+      var key = on.map(function (c) { return c.startTime + ':' + c.endTime + ':' + c.text; }).join('|');
       if (key === textShownKey) return;
       textShownKey = key;
       textSubsEl.innerHTML = '';
       on.forEach(function (c) {
         var d = document.createElement('div');
-        d.innerHTML = c.h;
+        d.innerHTML = cueHtml(c.text || '');
         textSubsEl.appendChild(d);
       });
     }
 
     function textSubTick() {
       try {
-        var s = activeTextSub();
+        var v = mediaElement();
         var on = [];
-        if (s) {
-          if (!s.cues && !s.loading && Date.now() >= s.retryAt) loadTextSub(s);
-          var idle = (typeof pm.getPlayerState === 'function') && pm.getPlayerState() === 'IDLE';
-          var v = videoElement();
-          if (s.cues && !idle && v) on = textCuesAt(s.cues, v.currentTime * 1000);
+        var t = v ? drawnTextTrack(v) : null;
+        if (t !== textLogged) {
+          textLogged = t;
+          if (t) log('text subtitles: drawn by the receiver (' + (t.label || t.language || 'track') + ')', 'dim');
+        }
+        if (t && t.cues) {
+          var now = v.currentTime;
+          for (var i = 0; i < t.cues.length; i++) {
+            var c = t.cues[i];
+            if (c.startTime > now) break;   // cues are kept in start order
+            if (now < c.endTime) on.push(c);
+          }
         }
         showTextCues(on);
         if (on.length) {
@@ -537,10 +493,7 @@
     // The sender switching tracks mid-cast (or turning subtitles off).
     if (cast.framework.messages.MessageType.EDIT_TRACKS_INFO) {
       pm.setMessageInterceptor(cast.framework.messages.MessageType.EDIT_TRACKS_INFO, function (req) {
-        if (req && req.activeTrackIds) {
-          activeTrackIds = req.activeTrackIds;
-          req.activeTrackIds = withoutDrawnTracks(req.activeTrackIds);
-        }
+        if (req && req.activeTrackIds) activeTrackIds = req.activeTrackIds;
         return req;
       });
     }
@@ -567,8 +520,6 @@
         activeTrackIds = req.activeTrackIds || [];
         var imageSubs = m.customData && m.customData.imageSubs;
         setImageSubs(imageSubs);
-        setTextSubs(tracks);
-        req.activeTrackIds = withoutDrawnTracks(activeTrackIds);
         if (imageSubs && imageSubs.length) {
           log('  picture subtitles on track(s) ' +
               imageSubs.map(function (x) { return x.trackId; }).join(',') +
