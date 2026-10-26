@@ -16,6 +16,14 @@
     /* Picture subtitles (PGS): placed over the video's picture area by imgSubTick. */
     #imgsubs { position: absolute; pointer-events: none; z-index: 5; }
     #imgsubs img { position: absolute; }
+    /* Text subtitles, drawn by textSubTick to look like the phone's: white sans-serif with a
+       soft shadow and no box, 5.33% of the picture's height (media3's default), 8% up. */
+    #textsubs { position: absolute; pointer-events: none; z-index: 5; display: flex;
+                flex-direction: column; justify-content: flex-end; align-items: center; }
+    #textsubs div { color: #fff; font-family: Roboto, "Noto Sans", Arial, sans-serif;
+                    text-align: center; white-space: pre-line; line-height: 1.25;
+                    text-shadow: 0.06em 0.06em 0.12em rgba(0,0,0,0.95), 0 0 0.2em rgba(0,0,0,0.6);
+                    max-width: 90%; }
     /* On-screen log overlay — so the TV itself shows what happened (no chrome://inspect needed). */
     /* Hidden by default (r9): the sender's Now Playing toggle shows it via {showLog:true}.
        Lines are still collected while hidden, so toggling on reveals the full history. */
@@ -32,11 +40,12 @@
 <body>
   <cast-media-player></cast-media-player>
   <div id="imgsubs"></div>
+  <div id="textsubs"></div>
   <div id="log"></div>
   <script>
     // Bump this on every deploy so the on-screen log tells you which receiver the TV
     // actually loaded — GitHub Pages caching means "I pushed it" isn't "it's live".
-    var RECEIVER_BUILD = 'r20 (picture subtitles)';
+    var RECEIVER_BUILD = 'r21 (text subtitles drawn by the receiver)';
 
     // Declared up here (not beside the listener below) because log mirroring starts with the
     // very first boot line, long before the SDK wiring runs.
@@ -397,10 +406,141 @@
       } catch (e) { /* subtitles must never be the thing that breaks playback */ }
     }
 
+    // ---- text subtitles (WebVTT) --------------------------------------------------------
+    // Drawn here too, not by the media element: its cues only change on timeupdate events
+    // (every 250ms or more), so lines came up to half a second late, and some TVs (LG webOS)
+    // ignore the sender's text style and draw white on a black box. The sender's VTT is
+    // already shifted to the stream's clock, so cue times compare with currentTime directly.
+    // CAF is never told these tracks are active, so it draws nothing of its own.
+    var textSubsEl = document.getElementById('textsubs');
+    var textSubs = {};         // trackId → { url, cues, loading, retryAt }
+    var textShownKey = null;   // what is on screen, to touch the DOM only on a change
+
+    function setTextSubs(tracks) {
+      textSubs = {};
+      showTextCues([]);
+      (tracks || []).forEach(function (tr) {
+        if (tr.type === 'TEXT' && tr.trackContentId && !imgSubs[tr.trackId]) {
+          textSubs[tr.trackId] = { url: tr.trackContentId, cues: null, loading: false, retryAt: 0 };
+        }
+      });
+    }
+
+    /** The active track ids with the ones drawn here taken out: what CAF is told. */
+    function withoutDrawnTracks(ids) {
+      return (ids || []).filter(function (id) { return !textSubs[id] && !imgSubs[id]; });
+    }
+
+    function activeTextSub() {
+      for (var i = 0; i < activeTrackIds.length; i++) {
+        if (textSubs[activeTrackIds[i]]) return textSubs[activeTrackIds[i]];
+      }
+      return null;
+    }
+
+    function vttMs(t) {
+      var p = t.split(':'), sec = parseFloat(p.pop()), min = parseInt(p.pop() || '0', 10),
+          hr = parseInt(p.pop() || '0', 10);
+      return Math.round(((hr * 60 + min) * 60 + sec) * 1000);
+    }
+
+    /** Cue text as HTML: <i>/<b>/<u> kept, any other tag dropped, the rest escaped. */
+    function cueHtml(text) {
+      return text.split(/(<\/?[^>]*>)/).map(function (part) {
+        var m = /^<(\/?)([ibu])(?:[.\s][^>]*)?>$/i.exec(part);
+        if (m) return '<' + m[1] + m[2].toLowerCase() + '>';
+        if (/^<[^>]*>$/.test(part)) return '';
+        return part.replace(/&(?!(amp|lt|gt|nbsp);)/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      }).join('');
+    }
+
+    function parseVtt(body) {
+      var cues = [];
+      body.replace(/\r/g, '').split(/\n\s*\n/).forEach(function (block) {
+        var lines = block.split('\n');
+        for (var i = 0; i < lines.length; i++) {
+          var m = /^\s*([\d:.]+)\s+-->\s+([\d:.]+)/.exec(lines[i]);
+          if (m) {
+            var text = lines.slice(i + 1).join('\n').trim();
+            if (text) cues.push({ s: vttMs(m[1]), e: vttMs(m[2]), h: cueHtml(text) });
+            return;
+          }
+        }
+      });
+      cues.sort(function (a, b) { return a.s - b.s; });
+      return cues;
+    }
+
+    function loadTextSub(s) {
+      s.loading = true;
+      var x = new XMLHttpRequest();
+      x.open('GET', s.url);
+      x.onload = function () {
+        s.cues = (x.status >= 200 && x.status < 300) ? parseVtt(x.responseText || '') : null;
+        if (s.cues) log('text subtitles: ' + s.cues.length + ' lines', 'dim');
+        else { s.loading = false; s.retryAt = Date.now() + 5000; }
+      };
+      x.onerror = function () {
+        s.loading = false; s.retryAt = Date.now() + 5000;
+        log('text subtitles: fetch failed — retrying', 'warn');
+      };
+      x.send();
+    }
+
+    /** Every cue on screen at [ms]: overlapping lines (a sign over dialogue) show together. */
+    function textCuesAt(cues, ms) {
+      var lo = 0, hi = cues.length - 1, last = -1;
+      while (lo <= hi) {
+        var mid = (lo + hi) >> 1;
+        if (cues[mid].s <= ms) { last = mid; lo = mid + 1; } else { hi = mid - 1; }
+      }
+      var on = [];
+      // Cues are sorted by start; a long one can still be running behind shorter ones.
+      for (var i = last; i >= 0 && i > last - 20; i--) if (ms < cues[i].e) on.unshift(cues[i]);
+      return on;
+    }
+
+    function showTextCues(on) {
+      var key = on.map(function (c) { return c.s + ':' + c.e; }).join(',');
+      if (key === textShownKey) return;
+      textShownKey = key;
+      textSubsEl.innerHTML = '';
+      on.forEach(function (c) {
+        var d = document.createElement('div');
+        d.innerHTML = c.h;
+        textSubsEl.appendChild(d);
+      });
+    }
+
+    function textSubTick() {
+      try {
+        var s = activeTextSub();
+        var on = [];
+        if (s) {
+          if (!s.cues && !s.loading && Date.now() >= s.retryAt) loadTextSub(s);
+          var idle = (typeof pm.getPlayerState === 'function') && pm.getPlayerState() === 'IDLE';
+          var v = videoElement();
+          if (s.cues && !idle && v) on = textCuesAt(s.cues, v.currentTime * 1000);
+        }
+        showTextCues(on);
+        if (on.length) {
+          var r = videoRect();
+          textSubsEl.style.left = r.left + 'px';
+          textSubsEl.style.top = r.top + 'px';
+          textSubsEl.style.width = r.width + 'px';
+          textSubsEl.style.height = (r.height * 0.92) + 'px';
+          textSubsEl.style.fontSize = (r.height * 0.0533) + 'px';
+        }
+      } catch (e) { /* subtitles must never be the thing that breaks playback */ }
+    }
+
     // The sender switching tracks mid-cast (or turning subtitles off).
     if (cast.framework.messages.MessageType.EDIT_TRACKS_INFO) {
       pm.setMessageInterceptor(cast.framework.messages.MessageType.EDIT_TRACKS_INFO, function (req) {
-        if (req && req.activeTrackIds) activeTrackIds = req.activeTrackIds;
+        if (req && req.activeTrackIds) {
+          activeTrackIds = req.activeTrackIds;
+          req.activeTrackIds = withoutDrawnTracks(req.activeTrackIds);
+        }
         return req;
       });
     }
@@ -427,6 +567,8 @@
         activeTrackIds = req.activeTrackIds || [];
         var imageSubs = m.customData && m.customData.imageSubs;
         setImageSubs(imageSubs);
+        setTextSubs(tracks);
+        req.activeTrackIds = withoutDrawnTracks(activeTrackIds);
         if (imageSubs && imageSubs.length) {
           log('  picture subtitles on track(s) ' +
               imageSubs.map(function (x) { return x.trackId; }).join(',') +
@@ -615,6 +757,7 @@
     setInterval(idleCheck, IDLE_CHECK_MS);
     setInterval(renderCheck, RENDER_CHECK_MS);
     setInterval(imgSubTick, 100);
+    setInterval(textSubTick, 40);
     // Anything logged during boot (codec probe included) goes out as soon as a sender attaches.
     try {
       ctx.addEventListener(cast.framework.system.EventType.SENDER_CONNECTED, function () {
