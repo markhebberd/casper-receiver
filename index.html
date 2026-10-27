@@ -47,7 +47,7 @@
   <script>
     // Bump this on every deploy so the on-screen log tells you which receiver the TV
     // actually loaded — GitHub Pages caching means "I pushed it" isn't "it's live".
-    var RECEIVER_BUILD = 'r23 (text subtitles placed and sized as the file says)';
+    var RECEIVER_BUILD = 'r24 (text subtitles read from the file itself, placement kept)';
 
     // Declared up here (not beside the listener below) because log mirroring starts with the
     // very first boot line, long before the SDK wiring runs.
@@ -419,6 +419,100 @@
     var textShownKey = null;   // what is on screen, to touch the DOM only on a change
     var textLogged = null;     // the track last reported in the log
 
+    // The TV's own cues keep each line's words but not where it goes or how big it is — a
+    // narrator at the top and a ticker at the bottom both came out as one block at the
+    // bottom. So the active track's VTT is fetched and read here, settings and all; the TV's
+    // track is drawn only until that arrives, or if it can't be fetched.
+    var textUrls = {};         // trackId → the VTT's URL, from the LOAD
+    var ownText = null;        // { url, cues, loading, retryAt } for the active text track
+
+    function setTextTracks(tracks) {
+      textUrls = {};
+      ownText = null;
+      (tracks || []).forEach(function (tr) {
+        if (tr.type === 'TEXT' && tr.trackContentId) textUrls[tr.trackId] = tr.trackContentId;
+      });
+    }
+
+    function activeTextUrl() {
+      for (var i = 0; i < activeTrackIds.length; i++) {
+        var id = activeTrackIds[i];
+        if (textUrls[id] && !imgSubs[id]) return textUrls[id];
+      }
+      return null;
+    }
+
+    function vttSeconds(t) {
+      var p = t.split(':'), s = 0;
+      for (var i = 0; i < p.length; i++) s = s * 60 + parseFloat(p[i]);
+      return s;
+    }
+
+    /** A WebVTT document as cues shaped like the TV's: times, raw text, line and position. */
+    function parseVtt(text) {
+      var cues = [];
+      text.replace(/\r\n?/g, '\n').split(/\n\n+/).forEach(function (block) {
+        var rows = block.split('\n'), i = 0;
+        while (i < rows.length && rows[i].indexOf('-->') < 0) i++;
+        if (i >= rows.length) return;
+        var m = /^\s*([\d:.]+)\s+-->\s+([\d:.]+)(.*)$/.exec(rows[i]);
+        if (!m) return;
+        var c = { startTime: vttSeconds(m[1]), endTime: vttSeconds(m[2]),
+                  text: rows.slice(i + 1).join('\n').replace(/\n+$/, ''), line: 'auto', snapToLines: true,
+                  lineAlign: 'start', position: 'auto', positionAlign: 'auto' };
+        m[3].trim().split(/\s+/).forEach(function (setting) {
+          var kv = /^(line|position):([\d.]+)(%?)(?:,([a-z-]+))?$/.exec(setting);
+          if (!kv) return;
+          if (kv[1] === 'line') {
+            c.line = parseFloat(kv[2]);
+            c.snapToLines = kv[3] !== '%';
+            if (kv[4]) c.lineAlign = kv[4];
+          } else if (kv[3] === '%') {
+            c.position = parseFloat(kv[2]);
+            if (kv[4]) c.positionAlign = kv[4];
+          }
+        });
+        if (c.text.trim()) cues.push(c);
+      });
+      cues.sort(function (a, b) { return a.startTime - b.startTime; });
+      return cues;
+    }
+
+    function loadOwnText(o) {
+      o.loading = true;
+      var x = new XMLHttpRequest();
+      x.open('GET', o.url);
+      x.onload = function () {
+        if (ownText !== o) return;
+        if (x.status !== 200) { x.onerror(); return; }
+        try {
+          o.cues = parseVtt(x.responseText);
+          var placed = o.cues.filter(function (c) { return c.snapToLines === false; }).length;
+          log('text subtitles: ' + o.cues.length + ' lines read from the file, ' + placed +
+              ' with their place on screen', 'dim');
+        } catch (e) {
+          o.loading = false; o.retryAt = Infinity;
+          log('text subtitles: unreadable file (' + e + ') — showing the TV\'s own', 'warn');
+        }
+      };
+      // Retry, but not every tick: the phone may be busy or briefly unreachable.
+      x.onerror = function () {
+        if (ownText !== o) return;
+        o.loading = false; o.retryAt = Date.now() + 5000;
+        log('text subtitles: fetch failed — showing the TV\'s own meanwhile', 'warn');
+      };
+      x.send();
+    }
+
+    /** The active text track's own cues, fetching them if need be; null until they're read. */
+    function ownTextCues() {
+      var url = activeTextUrl();
+      if (!url) { ownText = null; return null; }
+      if (!ownText || ownText.url !== url) ownText = { url: url, cues: null, loading: false, retryAt: 0 };
+      if (!ownText.cues && !ownText.loading && Date.now() >= ownText.retryAt) loadOwnText(ownText);
+      return ownText.cues;
+    }
+
     /** The page's media element, wherever CAF put it. */
     function mediaElement() {
       var v = videoElement();
@@ -533,10 +627,12 @@
           textLogged = t;
           if (t) log('text subtitles: drawn by the receiver (' + (t.label || t.language || 'track') + ')', 'dim');
         }
-        if (t && t.cues) {
+        // The file's own cues while the TV has a track on; the TV's until they're read.
+        var cues = t ? (ownTextCues() || t.cues) : null;
+        if (cues) {
           var now = v.currentTime;
-          for (var i = 0; i < t.cues.length; i++) {
-            var c = t.cues[i];
+          for (var i = 0; i < cues.length; i++) {
+            var c = cues[i];
             if (c.startTime > now) break;   // cues are kept in start order
             if (now < c.endTime) on.push(c);
           }
@@ -580,6 +676,7 @@
               ' ' + (tr.trackContentType || '') + ' ' + (tr.language || ''), 'dim');
         });
         activeTrackIds = req.activeTrackIds || [];
+        setTextTracks(tracks);
         var imageSubs = m.customData && m.customData.imageSubs;
         setImageSubs(imageSubs);
         if (imageSubs && imageSubs.length) {
