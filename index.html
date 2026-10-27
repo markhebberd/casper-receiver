@@ -47,7 +47,7 @@
   <script>
     // Bump this on every deploy so the on-screen log tells you which receiver the TV
     // actually loaded — GitHub Pages caching means "I pushed it" isn't "it's live".
-    var RECEIVER_BUILD = 'r24 (text subtitles read from the file itself, placement kept)';
+    var RECEIVER_BUILD = 'r25 (subtitles timed by the TV, placed as the file says)';
 
     // Declared up here (not beside the listener below) because log mirroring starts with the
     // very first boot line, long before the SDK wiring runs.
@@ -421,8 +421,11 @@
 
     // The TV's own cues keep each line's words but not where it goes or how big it is — a
     // narrator at the top and a ticker at the bottom both came out as one block at the
-    // bottom. So the active track's VTT is fetched and read here, settings and all; the TV's
-    // track is drawn only until that arrives, or if it can't be fetched.
+    // bottom. So the active track's VTT is fetched and read here, settings and all. Its
+    // TIMES are not used while the TV's cues are there: drawn by the file's own times (r24),
+    // lines came up to half a second late, so the TV must line them up with the video in a
+    // way the raw file doesn't. Each TV cue is matched to the file's line with the same
+    // words, and drawn when the TV says, where the file says.
     var textUrls = {};         // trackId → the VTT's URL, from the LOAD
     var ownText = null;        // { url, cues, loading, retryAt } for the active text track
 
@@ -487,6 +490,12 @@
         if (x.status !== 200) { x.onerror(); return; }
         try {
           o.cues = parseVtt(x.responseText);
+          o.byText = {};
+          o.cues.forEach(function (c) {
+            var k = plainText(c.text);
+            (o.byText[k] = o.byText[k] || []).push(c);
+          });
+          o.gapLogged = false;
           var placed = o.cues.filter(function (c) { return c.snapToLines === false; }).length;
           log('text subtitles: ' + o.cues.length + ' lines read from the file, ' + placed +
               ' with their place on screen', 'dim');
@@ -502,6 +511,34 @@
         log('text subtitles: fetch failed — showing the TV\'s own meanwhile', 'warn');
       };
       x.send();
+    }
+
+    /** A cue's words alone, for matching the TV's cue to the file's: tags and spacing gone. */
+    function plainText(text) {
+      return String(text || '').replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
+    }
+
+    /**
+     * The TV's cue [c] as drawn: its own times, with the file's place and size when the file
+     * has a line with the same words starting within a few seconds of it.
+     */
+    function placedLike(c, o) {
+      var list = o.byText[plainText(c.text)];
+      if (!list) return c;
+      var best = null;
+      for (var i = 0; i < list.length; i++) {
+        var gap = Math.abs(list[i].startTime - c.startTime);
+        if (gap < 3 && (!best || gap < Math.abs(best.startTime - c.startTime))) best = list[i];
+      }
+      if (!best) return c;
+      if (!o.gapLogged) {
+        o.gapLogged = true;
+        log('text subtitles: the TV times lines ' +
+            Math.round((c.startTime - best.startTime) * 1000) + 'ms from the file\'s times', 'dim');
+      }
+      return { startTime: c.startTime, endTime: c.endTime, text: best.text, line: best.line,
+               snapToLines: best.snapToLines, lineAlign: best.lineAlign,
+               position: best.position, positionAlign: best.positionAlign };
     }
 
     /** The active text track's own cues, fetching them if need be; null until they're read. */
@@ -627,14 +664,17 @@
           textLogged = t;
           if (t) log('text subtitles: drawn by the receiver (' + (t.label || t.language || 'track') + ')', 'dim');
         }
-        // The file's own cues while the TV has a track on; the TV's until they're read.
-        var cues = t ? (ownTextCues() || t.cues) : null;
+        // The TV's cues for timing, placed from the file once it's read; the file's own
+        // cues only if the TV's track holds none.
+        var own = t ? ownTextCues() : null;
+        var tvCues = t && t.cues && t.cues.length ? t.cues : null;
+        var cues = tvCues || own;
         if (cues) {
           var now = v.currentTime;
           for (var i = 0; i < cues.length; i++) {
             var c = cues[i];
             if (c.startTime > now) break;   // cues are kept in start order
-            if (now < c.endTime) on.push(c);
+            if (now < c.endTime) on.push(tvCues && own ? placedLike(c, ownText) : c);
           }
         }
         var r = videoRect();
