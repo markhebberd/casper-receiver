@@ -18,12 +18,14 @@
     #imgsubs img { position: absolute; }
     /* Text subtitles, drawn by textSubTick to look like the phone's: white sans-serif with a
        soft shadow and no box, 5.33% of the picture's height (media3's default), 8% up. */
-    #textsubs { position: absolute; pointer-events: none; z-index: 5; display: flex;
-                flex-direction: column; justify-content: flex-end; align-items: center; }
+    #textsubs { position: absolute; pointer-events: none; z-index: 5; }
+    #textsubs .stack { position: absolute; left: 0; right: 0; display: flex;
+                       flex-direction: column; align-items: center; }
     #textsubs div { color: #fff; font-family: Roboto, "Noto Sans", Arial, sans-serif;
                     text-align: center; white-space: pre-line; line-height: 1.25;
                     text-shadow: 0.06em 0.06em 0.12em rgba(0,0,0,0.95), 0 0 0.2em rgba(0,0,0,0.6);
                     max-width: 90%; }
+    #textsubs .placed { position: absolute; max-width: none; }
     /* On-screen log overlay — so the TV itself shows what happened (no chrome://inspect needed). */
     /* Hidden by default (r9): the sender's Now Playing toggle shows it via {showLog:true}.
        Lines are still collected while hidden, so toggling on reveals the full history. */
@@ -45,7 +47,7 @@
   <script>
     // Bump this on every deploy so the on-screen log tells you which receiver the TV
     // actually loaded — GitHub Pages caching means "I pushed it" isn't "it's live".
-    var RECEIVER_BUILD = 'r22 (text subtitles drawn from the TV\'s own track)';
+    var RECEIVER_BUILD = 'r23 (text subtitles placed and sized as the file says)';
 
     // Declared up here (not beside the listener below) because log mirroring starts with the
     // very first boot line, long before the SDK wiring runs.
@@ -449,15 +451,76 @@
       return found;
     }
 
-    function showTextCues(on) {
-      var key = on.map(function (c) { return c.startTime + ':' + c.endTime + ':' + c.text; }).join('|');
+    /** A cue's size from its <c.fsNNN> class (thousandths of the picture height), or null. */
+    function cueSize(text) {
+      var m = /<c\.fs(\d+)>/.exec(text || '');
+      return m ? parseInt(m[1], 10) / 1000 : null;
+    }
+
+    function num(v) { return typeof v === 'number' ? v : null; }
+
+    /**
+     * Where a cue goes: 'top' or 'bottom' (stacked there, so concurrent lines never overlap),
+     * or placed at its own line/position — a sign typeset onto the picture. A cue with no
+     * settings is a bottom line.
+     */
+    function cueSlot(c) {
+      var line = c.snapToLines === false ? num(c.line) : null;
+      var pos = num(c.position);
+      var centred = pos === null || Math.abs(pos - 50) <= 5;
+      if (line === null) return centred ? 'bottom' : 'placed';
+      if (centred && line >= 80 && c.lineAlign !== 'start') return 'bottom';
+      if (centred && line <= 20 && c.lineAlign !== 'end') return 'top';
+      return 'placed';
+    }
+
+    function cueDiv(c, h) {
+      var d = document.createElement('div');
+      d.innerHTML = cueHtml(c.text || '');
+      var size = cueSize(c.text);
+      d.style.fontSize = ((size || 0.0533) * h) + 'px';
+      return d;
+    }
+
+    function showTextCues(on, h) {
+      var key = h + '#' + on.map(function (c) { return c.startTime + ':' + c.endTime + ':' + c.text; }).join('|');
       if (key === textShownKey) return;
       textShownKey = key;
       textSubsEl.innerHTML = '';
+      var top = null, bottom = null;
       on.forEach(function (c) {
-        var d = document.createElement('div');
-        d.innerHTML = cueHtml(c.text || '');
-        textSubsEl.appendChild(d);
+        var slot = cueSlot(c), d = cueDiv(c, h);
+        if (slot === 'placed') {
+          var line = c.snapToLines === false ? num(c.line) : null, pos = num(c.position);
+          d.className = 'placed';
+          var tx = c.positionAlign === 'line-left' ? '0' : c.positionAlign === 'line-right' ? '-100%' : '-50%';
+          var ty = c.lineAlign === 'center' ? '-50%' : c.lineAlign === 'end' ? '-100%' : '0';
+          d.style.left = (pos === null ? 50 : pos) + '%';
+          d.style.top = (line === null ? 92 : line) + '%';
+          d.style.transform = 'translate(' + tx + ',' + ty + ')';
+          textSubsEl.appendChild(d);
+          return;
+        }
+        if (slot === 'top') {
+          if (!top) {
+            top = document.createElement('div');
+            top.className = 'stack';
+            top.style.top = num(c.line) + '%';
+            textSubsEl.appendChild(top);
+          }
+          top.appendChild(d);
+        } else {
+          if (!bottom) {
+            bottom = document.createElement('div');
+            bottom.className = 'stack';
+            var l = c.snapToLines === false ? num(c.line) : null;
+            // The file's own bottom line, else the phone's 8%.
+            bottom.style.bottom = (l !== null && c.lineAlign === 'end' ? Math.max(100 - l, 2) : 8) + '%';
+            textSubsEl.appendChild(bottom);
+          }
+          // A later line goes above the one already showing, as libass stacks them.
+          bottom.insertBefore(d, bottom.firstChild);
+        }
       });
     }
 
@@ -478,14 +541,13 @@
             if (now < c.endTime) on.push(c);
           }
         }
-        showTextCues(on);
+        var r = videoRect();
+        showTextCues(on, r.height);
         if (on.length) {
-          var r = videoRect();
           textSubsEl.style.left = r.left + 'px';
           textSubsEl.style.top = r.top + 'px';
           textSubsEl.style.width = r.width + 'px';
-          textSubsEl.style.height = (r.height * 0.92) + 'px';
-          textSubsEl.style.fontSize = (r.height * 0.0533) + 'px';
+          textSubsEl.style.height = r.height + 'px';
         }
       } catch (e) { /* subtitles must never be the thing that breaks playback */ }
     }
